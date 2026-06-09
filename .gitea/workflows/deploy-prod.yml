@@ -1,0 +1,70 @@
+name: Deploy → Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to promote to production (e.g. dev-abc1234f or dev-latest)'
+        required: true
+        default: 'dev-latest'
+
+jobs:
+  deploy-prod:
+    runs-on: self-hosted
+    timeout-minutes: 20
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Verify image exists
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          echo "Verifying outline-custom:${TAG} ..."
+          nerdctl \
+            --address /run/k3s/containerd/containerd.sock \
+            --namespace k8s.io \
+            images --filter "reference=outline-custom:${TAG}" \
+            --format "{{.Repository}}:{{.Tag}}  ({{.Size}})"
+          # Abort if image not found
+          nerdctl \
+            --address /run/k3s/containerd/containerd.sock \
+            --namespace k8s.io \
+            images --filter "reference=outline-custom:${TAG}" \
+            --format "{{.Tag}}" | grep -q "." || \
+            { echo "Image outline-custom:${TAG} not found — run deploy-dev first"; exit 1; }
+
+      - name: Deploy to outline (production)
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          kubectl -n outline set image deployment/outline outline="outline-custom:${TAG}"
+          kubectl -n outline patch deployment outline \
+            -p '{"spec":{"template":{"spec":{"containers":[{"name":"outline","imagePullPolicy":"IfNotPresent"}]}}}}'
+          kubectl -n outline rollout restart deployment/outline
+          kubectl -n outline rollout status deployment/outline --timeout=300s
+
+      - name: Health check
+        run: |
+          sleep 15
+          for i in 1 2 3; do
+            if curl -sf --max-time 15 "https://notes.gabouchieno.com/_health" | grep -q "OK"; then
+              echo "OK — https://notes.gabouchieno.com is healthy (attempt ${i})"
+              exit 0
+            fi
+            echo "Attempt ${i} failed, retrying in 15s ..."
+            sleep 15
+          done
+          echo "Health check failed after 3 attempts"
+          kubectl -n outline logs -l app=outline --tail=50
+          exit 1
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "================================================"
+          echo "  Production deployment complete"
+          echo "  Image : outline-custom:${{ inputs.image_tag }}"
+          echo "  URL   : https://notes.gabouchieno.com"
+          echo "  Time  : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "================================================"
