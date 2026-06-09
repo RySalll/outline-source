@@ -1,0 +1,81 @@
+# Custom Outline fork — self-contained multi-stage build
+# Combines the official Dockerfile.base (build) + Dockerfile (runtime) into one file
+# so builds are fully self-contained without needing outlinewiki/outline-base.
+#
+# Usage:
+#   nerdctl build -f Dockerfile.custom -t outline-custom:latest .
+#   docker   build -f Dockerfile.custom -t outline-custom:latest .
+
+ARG APP_PATH=/opt/outline
+ARG NODE_VERSION=24.16.0
+
+# ── Stage 1: deps + compile ───────────────────────────────────────────────────
+FROM node:${NODE_VERSION}-bookworm AS builder
+
+ARG APP_PATH
+WORKDIR $APP_PATH
+
+# Copy only manifest files first for better layer caching
+COPY package.json yarn.lock .yarnrc.yml ./
+COPY patches ./patches
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# 4 GB is enough for a dev build; official uses 24 GB for CI
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+
+RUN corepack enable && \
+    yarn install --immutable --network-timeout 1000000 && \
+    yarn cache clean
+
+# Copy source after deps are installed (cache deps layer)
+COPY . .
+
+ARG CDN_URL
+RUN yarn build
+
+# Prune to production-only dependencies
+RUN yarn workspaces focus --production && \
+    yarn cache clean
+
+# ── Stage 2: lean runtime image ───────────────────────────────────────────────
+FROM node:${NODE_VERSION}-slim AS runner
+
+LABEL org.opencontainers.image.source="https://git.gabouchieno.com/gitea-admin/outline-source"
+LABEL org.opencontainers.image.description="Custom Outline fork"
+
+ARG APP_PATH
+WORKDIR $APP_PATH
+ENV NODE_ENV=production
+
+RUN addgroup --gid 1001 nodejs && \
+    adduser --uid 1001 --ingroup nodejs nodejs && \
+    mkdir -p /var/lib/outline/data && \
+    chown -R nodejs:nodejs /var/lib/outline && \
+    chown -R nodejs:nodejs $APP_PATH
+
+COPY --from=builder --chown=nodejs:nodejs $APP_PATH/build       ./build
+COPY --from=builder --chown=nodejs:nodejs $APP_PATH/server      ./server
+COPY --from=builder --chown=nodejs:nodejs $APP_PATH/public      ./public
+COPY --from=builder --chown=nodejs:nodejs $APP_PATH/.sequelizerc ./.sequelizerc
+COPY --from=builder --chown=nodejs:nodejs $APP_PATH/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs $APP_PATH/package.json ./package.json
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends wget && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV FILE_STORAGE_LOCAL_ROOT_DIR=/var/lib/outline/data
+RUN chmod 1777 "$FILE_STORAGE_LOCAL_ROOT_DIR"
+
+VOLUME /var/lib/outline/data
+
+USER nodejs
+
+HEALTHCHECK --interval=1m \
+  CMD wget -qO- "http://localhost:${PORT:-3000}/_health" | grep -q "OK" || exit 1
+
+EXPOSE 3000
+CMD ["node", "build/server/index.js"]
