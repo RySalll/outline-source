@@ -15,9 +15,9 @@ jobs:
     environment: production
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
+      # No checkout needed — this job only promotes an already-built image
+      # using cluster commands. (actions/checkout would also fail: it needs
+      # node, which the host-mode runner does not have.)
       - name: Verify image exists
         run: |
           TAG="${{ inputs.image_tag }}"
